@@ -1,9 +1,6 @@
 # TableManager
 Linux + C Lang. = scriptLinuxFile &amp; Terminal command
 
-<img width="1024" height="1249" alt="image" src="https://github.com/user-attachments/assets/714faa9a-0acd-467e-a435-bddf3c080b7d" />
-
-
 [TableManager 흐름도]
 01 입력 처리: main.c에서 전달받은 여러 파일을 순회하며 확장자에 따라 분기.
 
