@@ -15,3 +15,16 @@ Linux + C Lang. = scriptLinuxFile &amp; Terminal command
 
 04 로그 관리: tempTableManager 폴더에 날짜별 로그 파일 생성, 결과를 화면과 로그에 동시 기록.
 05 출력 결과: 각 파일의 데이터 존재 개수, 비어 있는 셀 좌표, 시트명, 파일 경로, 분석 시각을 표시.
+
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+
+깃을 설치한 상태에서 시작하는 명령어입니다. 
+아래의 명령어를 복사하고 터미널 속에 붙여 넣어서 실행해주세요.
+
+https://github.com/blackgomtaeng/TableManager.git   # 깃허브 코드스페이스에서 프로젝트 클론 후 진입
+cd TableManager
+chmod +x buildTableManager.sh                       #스크립트 실행 권한 부여
+./buildTableManager.sh                              # 스크립트 실행
+./TableManager <업로드파일들을 올려주세요. 1개도 되고 2개이상을 올려주셔도 됩니다.>
