@@ -25,6 +25,6 @@ Linux + C Lang. = scriptLinuxFile &amp; Terminal command
 
 https://github.com/blackgomtaeng/TableManager.git   # 깃허브 코드스페이스에서 프로젝트 클론 후 진입
 cd TableManager
-chmod +x buildTableManager.sh                       #스크립트 실행 권한 부여
-./buildTableManager.sh                              # 스크립트 실행
-./TableManager <업로드파일들을 올려주세요. 1개도 되고 2개이상을 올려주셔도 됩니다.>
+chmod +x buildTM.sh                                 #스크립트 실행 권한 부여
+./buildTM.sh                                        # 스크립트 실행
+./TableManager <file1> <file2> <파일 갯수만큼>       # 업로드파일들을 올려주세요. 1개도 되고 2개이상을 올려주셔도 됩니다.
