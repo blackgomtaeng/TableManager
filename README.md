@@ -48,5 +48,4 @@ linux_specs.sh는 기본 리눅스 환경의 사양들을 확인하는 명령어
    추가로 linuxSpecs 다음에 현재기간에 맞춰서 출력하도록 제작을 해두었으니 그것을 보고 참고하시면 가장 좋을 것입니다.
    스크립트 실행은 아래와 같이 접근하시면 됩니다.
 
-chmod +x linux_specs.sh
-./linux_specs.sh
+chmod +x linux_specs.sh && ./linux_specs.sh
