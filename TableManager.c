@@ -1,53 +1,96 @@
-#define _POSIX_C_SOURCE 200809L   // POSIX 표준 기능 활성화 (예: strdup, realpath 등)
-#include <stdlib.h>               // 메모리 할당/해제 함수 포함
-#include <stdio.h>                // 파일 입출력 함수 포함
-#include <string.h>               // 문자열 처리 함수 포함
-#include <time.h>                 // 시간 관련 함수 포함
-#include "TableManager.h"         // 테이블 관리용 헤더파일 포함
-#include <xlsxio_read.h>          // XLSX 파일 읽기 라이브러리 포함
+#define _POSIX_C_SOURCE 200809L
+#include <stdarg.h>
+#include <unistd.h>
+#include "TableManager.h"
+#include <errno.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/stat.h>
+#include <time.h>
 
-char *realpath(const char *path, char *resolved_path);   // 파일 경로를 절대경로로 변환
-char *strdup(const char *s);                             // 문자열 복제 함수
+char default_path[PATH_MAX] = "./";
+char temp_folder[PATH_MAX] = "tempTableManager";
 
-Table* create_table(int rows, int cols) {                // 테이블 생성 함수
-    Table *t = malloc(sizeof(Table));                    // Table 구조체 메모리 할당
-    t->row_count = rows;                                 // 행 개수 설정
-    t->column_count = cols;                              // 열 개수 설정
-    t->rows = calloc(rows * cols, sizeof(char*));        // 데이터 저장 공간 초기화
-    t->headers = calloc(cols, sizeof(char*));            // 헤더 저장 공간 초기화
-    t->sheets = NULL;                                    // 시트 초기화
-    t->sheet_count = 0;                                  // 시트 개수 초기화
-    return t;                                            // 생성된 테이블 반환
+static char *duplicate_string(const char *source)
+{
+    if (!source) return strdup(""); // NULL이면 빈 문자열 반환
+    return strdup(source);
 }
 
-void destroy_table(Table *t) {                           // 테이블 메모리 해제 함수
-    if (!t) return;                                      // NULL 체크
-    for (int i = 0; i < t->row_count * t->column_count; i++)
-        if (t->rows[i]) free(t->rows[i]);                // 각 셀 데이터 해제
-    for (int j = 0; j < t->column_count; j++)
-        if (t->headers[j]) free(t->headers[j]);          // 헤더 해제
-    if (t->sheets) {                                     // 시트 존재 시 해제
-        for (int k = 0; k < t->sheet_count; k++)
-            if (t->sheets[k]) free(t->sheets[k]);
-        free(t->sheets);
+static void free_string_array(char **items, size_t count)
+{
+    if (!items) return; // NULL이면 바로 종료
+    for (size_t i = 0; i < count; i++) free(items[i]); // 각 문자열 해제
+    free(items); // 배열 해제
+}
+
+static bool reserve_cell_buffer(char ***data, int **rows, int **cols, size_t *capacity)
+{
+    size_t next = *capacity ? *capacity * 2 : 128; // 용량 두 배 또는 초기값
+    char **new_data = realloc(*data, next * sizeof(char *));
+    int *new_rows = realloc(*rows, next * sizeof(int));
+    int *new_cols = realloc(*cols, next * sizeof(int));
+    if (!new_data || !new_rows || !new_cols) { // 실패 시 메모리 해제
+        free(new_data);
+        free(new_rows);
+        free(new_cols);
+        return false;
     }
-    free(t->rows);                                       // 행 데이터 배열 해제
-    free(t->headers);                                    // 헤더 배열 해제
-    free(t);                                             // 구조체 자체 해제
+    *data = new_data;
+    *rows = new_rows;
+    *cols = new_cols;
+    *capacity = next;
+    return true;
 }
 
-static char* col_index_to_letter(int col) {              // 열 인덱스를 엑셀 열 문자로 변환
-    static char buf[10];                                 // 변환 결과 저장 버퍼
-    memset(buf, 0, sizeof(buf));
-    int idx = 0;
+Table *create_table(size_t rows, size_t cols)
+{
+    Table *t = malloc(sizeof(Table));
+    if (!t) return NULL; // 메모리 할당 실패
+    t->row_count = rows;
+    t->column_count = cols;
+    t->rows = calloc(rows * cols, sizeof(char *));
+    t->headers = calloc(cols, sizeof(char *));
+    if ((!t->rows && rows * cols > 0) || (!t->headers && cols > 0)) { // 실패 시 정리
+        free(t->rows);
+        free(t->headers);
+        free(t);
+        return NULL;
+    }
+    for (size_t i = 0; i < rows * cols; i++) t->rows[i] = duplicate_string(""); // 빈 문자열 초기화
+    for (size_t j = 0; j < cols; j++) t->headers[j] = duplicate_string(""); // 헤더 초기화
+    t->sheets = NULL;
+    t->sheet_count = 0;
+    t->filepath[0] = '\0';
+    t->timestamp[0] = '\0';
+    return t;
+}
+
+void destroy_table(Table *t)
+{
+    if (!t) return; // NULL이면 종료
+    free_string_array(t->rows, t->row_count * t->column_count);
+    free_string_array(t->headers, t->column_count);
+    free_string_array(t->sheets, t->sheet_count);
+    free(t);
+}
+
+static char *col_index_to_letter(size_t col)
+{
+    static char buf[16];
+    size_t idx = 0;
     col++;
-    while (col > 0) {                                    // 26진수 변환
+    while (col > 0 && idx + 1 < sizeof(buf)) { // 열 번호를 문자로 변환
         col--;
         buf[idx++] = 'A' + (col % 26);
         col /= 26;
     }
     buf[idx] = '\0';
-    for (int i = 0; i < idx / 2; i++) {                  // 문자열 뒤집기
+    for (size_t i = 0; i < idx / 2; i++) { // 문자열 뒤집기
         char tmp = buf[i];
         buf[i] = buf[idx - 1 - i];
         buf[idx - 1 - i] = tmp;
@@ -55,367 +98,497 @@ static char* col_index_to_letter(int col) {              // 열 인덱스를 엑
     return buf;
 }
 
-static Table* parse_csv(const char *filename) {          // CSV 파일을 읽어 테이블 구조체로 변환
-    FILE *fp = fopen(filename, "r");                     // 파일 열기
-    if (!fp) return NULL;                                // 파일 열기 실패 시 NULL 반환
-    int rows = 0, cols = 0;                              // 행, 열 개수 초기화
-    char buffer[1024];                                   // 한 줄 버퍼
+bool ensure_folder_exists(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) == 0) return S_ISDIR(st.st_mode); // 이미 존재하면 디렉토리 여부 확인
+    return mkdir(path, 0755) == 0 || errno == EEXIST; // 없으면 생성
+}
 
-    if (fgets(buffer, sizeof(buffer), fp)) {             // 첫 줄 읽기 (헤더)
-        char *token = strtok(buffer, ",\n");             // 콤마 기준으로 토큰 분리
-        while (token) { cols++; token = strtok(NULL, ",\n"); } // 열 개수 계산
-        rows++;                                          // 첫 줄은 헤더 → 행 개수 증가
+bool compose_path(char *dest, size_t dest_size, const char *dir, const char *name)
+{
+    if (!dest || !dir || !name) return false; // NULL 체크
+    if (snprintf(dest, dest_size, "%s/%s", dir, name) >= (int)dest_size) return false; // 버퍼 초과 방지
+    return true;
+}
+
+static bool output_vprintf(OutputSink *sink, const char *format, va_list args)
+{
+    if (!sink || !format) return false; // NULL 체크
+
+    if (sink->primary) {
+        va_list copy;
+        va_copy(copy, args);
+        if (vfprintf(sink->primary, format, copy) < 0) { // 출력 실패
+            va_end(copy);
+            return false;
+        }
+        va_end(copy);
     }
-    while (fgets(buffer, sizeof(buffer), fp)) rows++;    // 나머지 줄 개수 세기
-    rewind(fp);                                          // 파일 포인터 처음으로 되돌리기
 
-    if (rows <= 1 || cols <= 0) {                        // 데이터가 없으면 NULL 반환
+    if (sink->secondary) {
+        va_list copy;
+        va_copy(copy, args);
+        if (vfprintf(sink->secondary, format, copy) < 0) { // 출력 실패
+            va_end(copy);
+            return false;
+        }
+        va_end(copy);
+    }
+
+    return true;
+}
+
+static bool output_printf(OutputSink *sink, const char *format, ...)
+{
+    if (!sink || !format) return false; // NULL 체크
+
+    va_list args;
+    va_start(args, format);
+    bool result = output_vprintf(sink, format, args); // 가변 인자 전달
+    va_end(args);
+    return result;
+}
+
+const char *file_extension(const char *filename)
+{
+    if (!filename) return ""; // NULL이면 빈 문자열 반환
+    const char *ext = strrchr(filename, '.');
+    return ext ? ext : ""; // 확장자 반환
+}
+
+bool is_excel_file(const char *ext)
+{
+    if (!ext || !*ext) return false; // NULL 또는 빈 문자열
+    return strcasecmp(ext, ".xlsx") == 0 || strcasecmp(ext, ".xls") == 0; // 엑셀 확장자 확인
+}
+
+void set_default_path(const char *path)
+{
+    if (!path) return; // NULL이면 종료
+    strncpy(default_path, path, sizeof(default_path) - 1);
+    default_path[sizeof(default_path) - 1] = '\0'; // 널 종료 보장
+}
+
+void set_temp_folder(const char *folder)
+{
+    if (!folder) return; // NULL이면 종료
+    strncpy(temp_folder, folder, sizeof(temp_folder) - 1);
+    temp_folder[sizeof(temp_folder) - 1] = '\0'; // 널 종료 보장
+}
+
+static bool write_log_name(char *path, size_t path_size, const char *folder)
+{
+    if (!path || !folder) return false; // NULL 체크
+    time_t now = time(NULL);
+    struct tm tm;
+    if (!localtime_r(&now, &tm)) return false; // 시간 변환 실패
+    char filename[64];
+    if (strftime(filename, sizeof(filename), "tempTM%Y%m%d.txt", &tm) == 0) return false; // 포맷 실패
+    return compose_path(path, path_size, folder, filename); // 경로 생성
+}
+
+FILE *open_log_file(const char *folder, char *path, size_t path_size)
+{
+    if (!ensure_folder_exists(folder)) return NULL; // 폴더 없으면 생성 실패
+    if (!write_log_name(path, path_size, folder)) return NULL; // 로그 이름 생성 실패
+    FILE *fp = fopen(path, "a");
+    return fp; // 파일 포인터 반환
+}
+
+static bool has_nonblank(const char *value)
+{
+    if (!value) return false; // NULL 체크
+    for (size_t i = 0; value[i]; i++) {
+        if (value[i] != ' ' && value[i] != '\t' && value[i] != '\n' && value[i] != '\r') return true; // 공백 아닌 문자 발견
+    }
+    return false; // 모두 공백
+}
+
+static Table *initialize_table_with_headers(size_t row_count, size_t column_count)
+{
+    Table *t = create_table(row_count, column_count);
+    if (!t) return NULL; // 테이블 생성 실패
+    t->sheets = malloc(sizeof(char *));
+    if (!t->sheets) { // 시트 메모리 실패
+        destroy_table(t);
+        return NULL;
+    }
+    t->sheets[0] = duplicate_string("Default"); // 기본 시트 이름
+    t->sheet_count = 1;
+    return t;
+}
+
+static Table *parse_csv(const char *filename)
+{
+    FILE *fp = fopen(filename, "r");
+    if (!fp) return NULL; // 파일 열기 실패
+    int rows = 0;
+    int cols = 0;
+    char buffer[1024];
+    if (fgets(buffer, sizeof(buffer), fp)) { // 첫 줄 읽기
+        char *token = strtok(buffer, ",\n");
+        while (token) { // 열 개수 계산
+            cols++;
+            token = strtok(NULL, ",\n");
+        }
+        rows++;
+    }
+    while (fgets(buffer, sizeof(buffer), fp)) rows++; // 행 개수 계산
+    rewind(fp);
+    if (rows <= 1 || cols <= 0) { // 데이터 없음
         fclose(fp);
         return NULL;
     }
-
-    Table *t = create_table(rows - 1, cols);             // 헤더 제외한 행 개수로 테이블 생성
-    if (fgets(buffer, sizeof(buffer), fp)) {             // 헤더 행 읽기
-        int col = 0;
-        char *token = strtok(buffer, ",\n");
-        while (token) {
-            t->headers[col] = strdup(token);             // 헤더 저장
-            col++;
-            token = strtok(NULL, ",\n");
-        }
+    Table *t = initialize_table_with_headers((size_t)(rows - 1), (size_t)cols);
+    if (!t) { // 테이블 생성 실패
+        fclose(fp);
+        return NULL;
     }
-    int row = 0;
-    while (fgets(buffer, sizeof(buffer), fp)) {          // 데이터 행 반복
+    if (fgets(buffer, sizeof(buffer), fp)) { // 헤더 읽기
         int col = 0;
         char *token = strtok(buffer, ",\n");
         while (token && col < cols) {
-            t->rows[row * t->column_count + col] = strdup(token); // 셀 값 저장
+            free(t->headers[col]);
+            t->headers[col] = duplicate_string(token);
             col++;
             token = strtok(NULL, ",\n");
         }
-        while (col < cols) {                             // 부족한 열은 빈 문자열로 채움
-            t->rows[row * t->column_count + col] = strdup("");
+    }
+    for (size_t row = 0; row < t->row_count && fgets(buffer, sizeof(buffer), fp); row++) {
+        int col = 0;
+        char *token = strtok(buffer, ",\n");
+        while (token && col < (int)t->column_count) {
+            free(t->rows[row * t->column_count + col]);
+            t->rows[row * t->column_count + col] = duplicate_string(token);
+            col++;
+            token = strtok(NULL, ",\n");
+        }
+        while (col < (int)t->column_count) { // 빈 셀 채우기
+            free(t->rows[row * t->column_count + col]);
+            t->rows[row * t->column_count + col] = duplicate_string("");
             col++;
         }
-        row++;
     }
-    fclose(fp);                                          // 파일 닫기
-
-    t->sheet_count = 1;                                  // 시트 개수 1개
-    t->sheets = malloc(sizeof(char*));                   // 시트 배열 할당
-    t->sheets[0] = strdup("Default");                    // 기본 시트 이름 저장
-
-    realpath(filename, t->filepath);                     // 파일 절대경로 저장
-    time_t now = time(NULL);                             // 현재 시간 가져오기
-    strftime(t->timestamp, sizeof(t->timestamp), "%Y.%m.%d %H:%M:%S", localtime(&now)); // 타임스탬프 저장
-
-    return t;                                            // 테이블 반환
+    fclose(fp);
+    set_table_metadata(t, filename);
+    return t;
 }
 
-static Table* parse_xlsx(const char *filename) {         // XLSX 파일을 읽어 테이블 구조체로 변환
-    xlsxioreader xlsxioread = xlsxioread_open(filename); // XLSX 파일 열기
-    if (!xlsxioread) return NULL;                        // 실패 시 NULL 반환
-
-    Table *t = malloc(sizeof(Table));                    // 테이블 구조체 메모리 할당
-    t->headers = NULL;                                   // 초기화
+static Table *parse_xlsx(const char *filename)
+{
+    xlsxioreader reader = xlsxioread_open(filename);
+    if (!reader) return NULL; // 파일 열기 실패
+    Table *t = malloc(sizeof(Table));
+    if (!t) { // 메모리 실패
+        xlsxioread_close(reader);
+        return NULL;
+    }
+    t->headers = NULL;
     t->rows = NULL;
     t->sheets = NULL;
     t->sheet_count = 0;
     t->row_count = 0;
     t->column_count = 0;
-
-    xlsxioreadersheetlist sheetlist = xlsxioread_sheetlist_open(xlsxioread); // 시트 목록 열기
-    const char *sheetname;
-    int count = 0;
-    while ((sheetname = xlsxioread_sheetlist_next(sheetlist)) != NULL) {     // 시트 이름 반복
-        char **new_sheets = realloc(t->sheets, sizeof(char*) * (count + 1)); // 시트 배열 확장
-        if (!new_sheets) break;
-        t->sheets = new_sheets;
-        t->sheets[count] = strdup(sheetname);            // 시트 이름 저장
-        count++;
+    xlsxioreadersheetlist sheetlist = xlsxioread_sheetlist_open(reader);
+    if (!sheetlist) { // 시트 목록 실패
+        xlsxioread_close(reader);
+        free(t);
+        return NULL;
     }
-    xlsxioread_sheetlist_close(sheetlist);               // 시트 목록 닫기
-    t->sheet_count = count;                              // 시트 개수 저장
-
-    if (count > 0) {                                     // 첫 번째 시트 읽기
-        const char *sheetname = t->sheets[0];
-        xlsxioreadersheet sheet = xlsxioread_sheet_open(xlsxioread, sheetname, XLSXIOREAD_SKIP_NONE);
+    const char *sheetname;
+    size_t sheet_count = 0;
+    while ((sheetname = xlsxioread_sheetlist_next(sheetlist)) != NULL) {
+        char **new_sheets = realloc(t->sheets, sizeof(char *) * (sheet_count + 1));
+        if (!new_sheets) break; // 메모리 실패
+        t->sheets = new_sheets;
+        t->sheets[sheet_count++] = duplicate_string(sheetname);
+    }
+    xlsxioread_sheetlist_close(sheetlist);
+    t->sheet_count = sheet_count;
+    if (sheet_count > 0) {
+        xlsxioreadersheet sheet = xlsxioread_sheet_open(reader, t->sheets[0], XLSXIOREAD_SKIP_NONE);
         if (sheet) {
-            int maxRow = -1, maxCol = -1;                // 최대 행/열 추적
-            char *cellData[100000];                      // 셀 데이터 저장
-            int cellCount = 0;
-            int *cellRows = malloc(sizeof(int) * 100000);
-            int *cellCols = malloc(sizeof(int) * 100000);
-
-            int row = 0, col = 0;
+            char **cellData = NULL;
+            int *cellRows = NULL;
+            int *cellCols = NULL;
+            size_t capacity = 0;
+            size_t cellCount = 0;
+            int maxRow = -1;
+            int maxCol = -1;
+            int row = 0;
             XLSXIOCHAR *value;
-
-            while (xlsxioread_sheet_next_row(sheet)) {   // 행 반복
-                col = 0;
-                while ((value = xlsxioread_sheet_next_cell(sheet)) != NULL) { // 셀 반복
-                    if (cellCount < 100000) {
-                        cellData[cellCount] = strdup(value ? value : "");    // 셀 값 저장
-                        cellRows[cellCount] = row;
-                        cellCols[cellCount] = col;
-                        if (row > maxRow) maxRow = row;                      // 최대 행 갱신
-                        if (col > maxCol) maxCol = col;                      // 최대 열 갱신
-                        cellCount++;
-                    }
-                    if (value) xlsxioread_free(value);   // 메모리 해제
+            while (xlsxioread_sheet_next_row(sheet)) {
+                int col = 0;
+                while ((value = xlsxioread_sheet_next_cell(sheet)) != NULL) {
+                    if (cellCount == capacity && !reserve_cell_buffer(&cellData, &cellRows, &cellCols, &capacity)) break; // 버퍼 확장 실패
+                    cellData[cellCount] = duplicate_string(value);
+                    cellRows[cellCount] = row;
+                    cellCols[cellCount] = col;
+                    if (row > maxRow) maxRow = row;
+                    if (col > maxCol) maxCol = col;
+                    cellCount++;
+                    xlsxioread_free(value);
                     col++;
                 }
                 row++;
             }
-
-            t->row_count = maxRow;                       // 헤더 제외한 데이터 행 개수
-            t->column_count = maxCol + 1;                // 열 개수
-
-            t->headers = calloc(t->column_count, sizeof(char*));             // 헤더 배열 초기화
-            t->rows = calloc(t->row_count * t->column_count, sizeof(char*)); // 데이터 배열 초기화
-
-            for (int i = 0; i < t->row_count * t->column_count; i++)
-                t->rows[i] = strdup("");                 // 빈 문자열로 초기화
-            for (int j = 0; j < t->column_count; j++)
-                t->headers[j] = strdup("");              // 헤더 초기화
-
-            for (int i = 0; i < cellCount; i++) {        // 셀 데이터 복사
+            size_t data_rows = maxRow > 0 ? (size_t)maxRow : 0;
+            size_t columns = maxCol >= 0 ? (size_t)maxCol + 1 : 0;
+            Table *copy = initialize_table_with_headers(data_rows, columns);
+            if (!copy) { // 테이블 생성 실패
+                for (size_t i = 0; i < cellCount; i++) free(cellData[i]);
+                free(cellData);
+                free(cellRows);
+                free(cellCols);
+                xlsxioread_sheet_close(sheet);
+                xlsxioread_close(reader);
+                destroy_table(t);
+                return NULL;
+            }
+            free(t->sheets);
+            *t = *copy;
+            free(copy);
+            for (size_t i = 0; i < cellCount; i++) {
                 int r = cellRows[i];
                 int c = cellCols[i];
-
-                if (r == 0) {                            // 첫 행은 헤더
-                    if (t->headers[c]) free(t->headers[c]);
-                    t->headers[c] = strdup(cellData[i]);
-                } else {                                 // 나머지는 데이터 행
-                    int idx = (r - 1) * t->column_count + c;
-                    if (idx < t->row_count * t->column_count) {
-                        if (t->rows[idx]) free(t->rows[idx]);
-                        t->rows[idx] = strdup(cellData[i]);
-                    }
+                if (r == 0) { // 헤더 처리
+                    free(t->headers[c]);
+                    t->headers[c] = duplicate_string(cellData[i]);
+                } else if ((size_t)(r - 1) < t->row_count && (size_t)c < t->column_count) {
+                    size_t idx = (size_t)(r - 1) * t->column_count + (size_t)c;
+                    free(t->rows[idx]);
+                    t->rows[idx] = duplicate_string(cellData[i]);
                 }
-                free(cellData[i]);                       // 임시 데이터 해제
+                free(cellData[i]);
             }
-
+            free(cellData);
             free(cellRows);
             free(cellCols);
-            xlsxioread_sheet_close(sheet);               // 시트 닫기
+            xlsxioread_sheet_close(sheet);
         }
     }
-
-    realpath(filename, t->filepath);                     // 파일 절대경로 저장
-    time_t now = time(NULL);                             // 현재 시간 가져오기
-    strftime(t->timestamp, sizeof(t->timestamp), "%Y.%m.%d %H:%M:%S", localtime(&now)); // 타임스탬프 저장
-
-    xlsxioread_close(xlsxioread);                        // XLSX 파일 닫기
-    return t;                                            // 테이블 반환
+    xlsxioread_close(reader);
+    set_table_metadata(t, filename);
+    return t;
 }
 
-Table* load_table(const char *filename) {                     // 파일 확장자에 따라 테이블 로드
-    const char *ext = strrchr(filename, '.');                  // 파일 확장자 추출
-    if (!ext) return NULL;                                     // 확장자 없으면 NULL 반환
-    if (strcmp(ext, ".csv") == 0) return parse_csv(filename);  // CSV 파일이면 parse_csv 호출
-    if (strcmp(ext, ".xlsx") == 0 || strcmp(ext, ".xls") == 0) return parse_xlsx(filename); // XLSX/XLS 파일이면 parse_xlsx 호출
-    return NULL;                                               // 지원하지 않는 확장자면 NULL 반환
+Table *load_table(const char *filename)
+{
+    const char *ext = file_extension(filename);
+    if (!ext[0]) return NULL; // 확장자 없음
+    if (strcasecmp(ext, ".csv") == 0) return parse_csv(filename); // CSV 처리
+    if (is_excel_file(ext)) return parse_xlsx(filename); // 엑셀 처리
+    return NULL; // 지원하지 않는 확장자
 }
 
-void serialize_table(Table *t, const char *filename) {         // 테이블을 CSV 형식으로 저장
-    FILE *fp = fopen(filename, "w");                           // 쓰기 모드로 파일 열기
-    if (!fp) return;                                           // 파일 열기 실패 시 종료
-    for (int j = 0; j < t->column_count; j++)                  // 헤더 출력
-        fprintf(fp, "%s%s", t->headers[j], j == t->column_count - 1 ? "\n" : ",");
-    for (int i = 0; i < t->row_count; i++)                     // 데이터 행 출력
-        for (int j = 0; j < t->column_count; j++)
-            fprintf(fp, "%s%s", t->rows[i * t->column_count + j], j == t->column_count - 1 ? "\n" : ",");
-    fclose(fp);                                                // 파일 닫기
+void serialize_table(const Table *t, const char *filename)
+{
+    if (!t || !filename) return; // NULL 체크
+    FILE *fp = fopen(filename, "w");
+    if (!fp) return; // 파일 열기 실패
+    for (size_t j = 0; j < t->column_count; j++)
+        fprintf(fp, "%s%s", t->headers[j], j + 1 == t->column_count ? "\n" : ","); // 헤더 출력
+    for (size_t i = 0; i < t->row_count; i++)
+        for (size_t j = 0; j < t->column_count; j++)
+            fprintf(fp, "%s%s", t->rows[i * t->column_count + j], j + 1 == t->column_count ? "\n" : ","); // 데이터 출력
+    fclose(fp);
 }
 
-Table* deserialize_table(const char *filename) {               // CSV 파일을 테이블로 복원
-    return parse_csv(filename);                                // parse_csv 호출
+Table *deserialize_table(const char *filename)
+{
+    return load_table(filename); // 파일 로드
 }
 
-void analyze_table(Table *t, const char *filename, FILE *out) { // 테이블 분석 결과 출력
-    int existCount = 0;                                        // 실제 데이터 개수
-    char **nonExistCoords = NULL;                              // 비어있는 셀 좌표 저장
-    int nonExistCount = 0;                                     // 비어있는 셀 개수
-    int allocatedSize = 0;                                     // 좌표 배열 크기 관리
-
-    int firstRow = -1, firstCol = -1, lastCol = -1;            // 데이터 시작/끝 위치 추적
-    int actualFirstRow = -1, actualLastRow = -1;               // 실제 출력용 행 번호
-
-    for (int i = 0; i < t->row_count; i++) {                   // 모든 행 반복
-        for (int j = 0; j < t->column_count; j++) {            // 모든 열 반복
-            char *val = t->rows[i * t->column_count + j];      // 셀 값 가져오기
-
-            int hasData = 0;                                   // 데이터 존재 여부
-            if (val != NULL && strlen(val) > 0) {              // 값이 존재하면 검사
-                for (int k = 0; val[k] != '\0'; k++) {
-                    if (val[k] != ' ' && val[k] != '\t' && val[k] != '\n' && val[k] != '\r') {
-                        hasData = 1;                           // 공백이 아닌 값 존재
-                        break;
-                    }
+void analyze_table(const Table *t, const char *filename, OutputSink *out)
+{
+    if (!t || !filename || !out) return; // NULL 체크
+    int existCount = 0;
+    char **nonExistCoords = NULL;
+    int nonExistCount = 0;
+    int allocatedSize = 0;
+    int firstRow = -1;
+    int firstCol = -1;
+    int lastCol = -1;
+    int actualFirstRow = -1;
+    int actualLastRow = -1;
+    for (size_t i = 0; i < t->row_count; i++) {
+        for (size_t j = 0; j < t->column_count; j++) {
+            const char *val = t->rows[i * t->column_count + j];
+            if (has_nonblank(val)) { // 값 존재
+                existCount++;
+                if (firstRow == -1) {
+                    firstRow = (int)i;
+                    actualFirstRow = (int)i + 2;
                 }
+                actualLastRow = (int)i + 2;
+                if (firstCol == -1) firstCol = (int)j;
+                if ((int)j > lastCol) lastCol = (int)j;
+                continue;
             }
-
-            if (hasData) {                                     // 데이터가 존재하는 경우
-                existCount++;                                  // 존재 데이터 개수 증가
-                if (firstRow == -1) {                          // 첫 데이터 위치 기록
-                    firstRow = i;
-                    actualFirstRow = i + 2;                    // 헤더 포함 → +2
-                }
-                actualLastRow = i + 2;                         // 마지막 데이터 행 갱신
-                if (firstCol == -1) firstCol = j;              // 첫 열 기록
-                if (j > lastCol) lastCol = j;                  // 마지막 열 갱신
-            } else {                                           // 데이터가 없는 경우
-                if (nonExistCount >= allocatedSize) {          // 좌표 배열 확장 필요 시
-                    allocatedSize = (allocatedSize == 0) ? 100 : allocatedSize * 2;
-                    char **tmp = realloc(nonExistCoords, sizeof(char*) * allocatedSize);
-                    if (!tmp) break;
-                    nonExistCoords = tmp;
-                }
-
-                char buf[32];                                  // 좌표 문자열 생성
-                snprintf(buf, sizeof(buf), "(%s, %d)", col_index_to_letter(j), i + 2); // 열 문자, 행 번호
-                nonExistCoords[nonExistCount] = strdup(buf);   // 좌표 저장
-                nonExistCount++;
+            if (nonExistCount >= allocatedSize) {
+                allocatedSize = allocatedSize ? allocatedSize * 2 : 100;
+                char **tmp = realloc(nonExistCoords, sizeof(char *) * allocatedSize);
+                if (!tmp) break; // 메모리 실패
+                nonExistCoords = tmp;
             }
+            char buf[32];
+            snprintf(buf, sizeof(buf), "(%s, %d)", col_index_to_letter(j), (int)i + 2);
+            nonExistCoords[nonExistCount++] = duplicate_string(buf);
         }
     }
-
-    fprintf(out, "[%s]\n", filename);                          // 파일 이름 출력
-    for (int s = 0; s < t->sheet_count; s++)                   // 시트 이름 출력
-        fprintf(out, "   sheet명(%d): %s\n", s + 1, t->sheets[s]);
-
-    if (firstRow != -1) {                                      // 데이터 시작/종료 위치 출력
-        fprintf(out, "   시작: %s, %d    종료: %s, %d\n",
-                col_index_to_letter(firstCol), actualFirstRow,
-                col_index_to_letter(lastCol), actualLastRow);
-    } else {
-        fprintf(out, "   시작: -, -    종료: -, -\n");         // 데이터 없음
-    }
-
-    fprintf(out, "   실존 데이터 갯수: %d\n", existCount);     // 실제 데이터 개수 출력
-    fprintf(out, "   가로(열) × 세로(행) : %d × %d\n", t->column_count, t->row_count); // 테이블 크기 출력
-    fprintf(out, "   비실존 데이터 갯수: %d\n", nonExistCount); // 비어있는 셀 개수 출력
-    fprintf(out, "   비실존 데이터 좌표값: ");                 // 비어있는 셀 좌표 출력
+    output_printf(out, "[%s]\n", filename);
+    for (size_t s = 0; s < t->sheet_count; s++)
+        output_printf(out, "   sheet명(%zu): %s\n", s + 1, t->sheets[s]); // 시트명 출력
+    if (firstRow != -1)
+        output_printf(out, "   시작: %s, %d    종료: %s, %d\n", col_index_to_letter(firstCol), actualFirstRow,
+                      col_index_to_letter(lastCol), actualLastRow); // 시작/종료 위치
+    else
+        output_printf(out, "   시작: -, -    종료: -, -\n"); // 데이터 없음
+    output_printf(out, "   실존 데이터 갯수: %d\n", existCount);
+    output_printf(out, "   가로(열) × 세로(행) : %zu × %zu\n", t->column_count, t->row_count);
+    output_printf(out, "   비실존 데이터 갯수: %d\n", nonExistCount);
+    output_printf(out, "   비실존 데이터 좌표값: ");
     for (int k = 0; k < nonExistCount; k++) {
-        fprintf(out, "%s ", nonExistCoords[k]);
-        free(nonExistCoords[k]);                               // 좌표 메모리 해제
+        output_printf(out, "%s ", nonExistCoords[k]);
+        free(nonExistCoords[k]);
     }
-    if (nonExistCoords) free(nonExistCoords);                  // 좌표 배열 해제
-
-    fprintf(out, "\n");
-    fprintf(out, "   업로드 파일의 경로 위치: %s\n", t->filepath); // 파일 경로 출력
-    fprintf(out, "   확인한 기간 및 시간: %s\n\n", t->timestamp); // 분석 시간 출력
+    free(nonExistCoords);
+    output_printf(out, "\n");
+    output_printf(out, "   업로드 파일의 경로 위치: %s\n", t->filepath);
+    output_printf(out, "   확인한 기간 및 시간: %s\n\n", t->timestamp);
 }
 
-void analyze_all_sheets(xlsxioreader xlsxioread, const char *filename, FILE *out) {   // 모든 시트를 분석하는 함수
-    xlsxioreadersheetlist sheetlist = xlsxioread_sheetlist_open(xlsxioread);          // 시트 목록 열기
+void analyze_all_sheets(xlsxioreader xlsxioread, const char *filename, OutputSink *out)
+{
+    if (!xlsxioread || !filename || !out) return; // NULL 체크
+    xlsxioreadersheetlist sheetlist = xlsxioread_sheetlist_open(xlsxioread);
+    if (!sheetlist) return; // 시트 목록 실패
     const char *sheetname;
-    
-    while ((sheetname = xlsxioread_sheetlist_next(sheetlist)) != NULL) {              // 각 시트 반복
-        xlsxioreadersheet sheet = xlsxioread_sheet_open(xlsxioread, sheetname, XLSXIOREAD_SKIP_NONE); // 시트 열기
-        if (!sheet) continue;                                                         // 시트 열기 실패 시 건너뜀
-
-        int maxRow = -1, maxCol = -1;                                                 // 최대 행/열 추적
-        char *cellData[100000];                                                       // 셀 데이터 저장
-        int cellCount = 0;
-        int *cellRows = malloc(sizeof(int) * 100000);                                 // 셀 행 인덱스 저장
-        int *cellCols = malloc(sizeof(int) * 100000);                                 // 셀 열 인덱스 저장
-
-        int row = 0, col = 0;
+    while ((sheetname = xlsxioread_sheetlist_next(sheetlist)) != NULL) {
+        xlsxioreadersheet sheet = xlsxioread_sheet_open(xlsxioread, sheetname, XLSXIOREAD_SKIP_NONE);
+        if (!sheet) continue; // 시트 열기 실패
+        size_t cellCount = 0;
+        size_t capacity = 0;
+        char **cellData = NULL;
+        int *cellRows = NULL;
+        int *cellCols = NULL;
+        int maxRow = -1;
+        int maxCol = -1;
+        int row = 0;
         XLSXIOCHAR *value;
-
-        while (xlsxioread_sheet_next_row(sheet)) {                                    // 행 반복
-            col = 0;
-            while ((value = xlsxioread_sheet_next_cell(sheet)) != NULL) {             // 셀 반복
-                if (cellCount < 100000) {
-                    cellData[cellCount] = strdup(value ? value : "");                 // 셀 값 저장
-                    cellRows[cellCount] = row;                                        // 행 번호 기록
-                    cellCols[cellCount] = col;                                        // 열 번호 기록
-                    if (row > maxRow) maxRow = row;                                   // 최대 행 갱신
-                    if (col > maxCol) maxCol = col;                                   // 최대 열 갱신
-                    cellCount++;
+        while (xlsxioread_sheet_next_row(sheet)) {
+            int col = 0;
+            while ((value = xlsxioread_sheet_next_cell(sheet)) != NULL) {
+                if (cellCount == capacity && !reserve_cell_buffer(&cellData, &cellRows, &cellCols, &capacity)) {
+                    xlsxioread_free(value);
+                    break;
                 }
-                if (value) xlsxioread_free(value);                                    // 메모리 해제
+                cellData[cellCount] = duplicate_string(value);
+                cellRows[cellCount] = row;
+                cellCols[cellCount] = col;
+                if (row > maxRow) maxRow = row;
+                if (col > maxCol) maxCol = col;
+                cellCount++;
+                xlsxioread_free(value);
                 col++;
             }
             row++;
         }
-
-        fprintf(out, "[%s - Sheet: %s]\n", filename, sheetname);                      // 시트 이름 출력
-        
-        int existCount = 0;                                                           // 실제 데이터 개수
-        char **nonExistCoords = NULL;                                                 // 비어있는 셀 좌표 저장
+        output_printf(out, "[%s - Sheet: %s]\n", filename, sheetname);
+        int existCount = 0;
+        char **nonExistCoords = NULL;
         int nonExistCount = 0;
         int allocatedSize = 0;
-        int firstRow = -1, firstCol = -1, lastCol = -1;                               // 데이터 시작/끝 위치 추적
-        int actualFirstRow = -1, actualLastRow = -1;
-
-        for (int i = 1; i <= maxRow; i++) {                                           // 모든 행 반복
-            for (int j = 0; j <= maxCol; j++) {                                       // 모든 열 반복
-                char *val = "";                                                       // 기본값 빈 문자열
-                
-                for (int k = 0; k < cellCount; k++) {                                 // 해당 좌표의 값 찾기
+        int firstRow = -1;
+        int firstCol = -1;
+        int lastCol = -1;
+        int actualFirstRow = -1;
+        int actualLastRow = -1;
+        for (int i = 1; i <= maxRow; i++) {
+            for (int j = 0; j <= maxCol; j++) {
+                const char *val = "";
+                for (size_t k = 0; k < cellCount; k++) {
                     if (cellRows[k] == i && cellCols[k] == j) {
                         val = cellData[k];
                         break;
                     }
                 }
-
-                int hasData = 0;                                                      // 데이터 존재 여부
-                if (val != NULL && strlen(val) > 0) {                                 // 값이 존재하면 검사
-                    for (int k = 0; val[k] != '\0'; k++) {
-                        if (val[k] != ' ' && val[k] != '\t' && val[k] != '\n' && val[k] != '\r') {
-                            hasData = 1;                                              // 공백이 아닌 값 존재
-                            break;
-                        }
-                    }
-                }
-
-                if (hasData) {                                                        // 데이터가 존재하는 경우
-                    existCount++;                                                     // 존재 데이터 개수 증가
-                    if (firstRow == -1) {                                             // 첫 데이터 위치 기록
+                if (has_nonblank(val)) { // 값 존재
+                    existCount++;
+                    if (firstRow == -1) {
                         firstRow = i;
-                        actualFirstRow = i + 1;                                       // 실제 출력용 행 번호
+                        actualFirstRow = i + 1;
                     }
-                    actualLastRow = i + 1;                                            // 마지막 데이터 행 갱신
-                    if (firstCol == -1) firstCol = j;                                 // 첫 열 기록
-                    if (j > lastCol) lastCol = j;                                     // 마지막 열 갱신
-                } else {                                                              // 데이터가 없는 경우
-                    if (nonExistCount >= allocatedSize) {                             // 좌표 배열 확장 필요 시
-                        allocatedSize = (allocatedSize == 0) ? 100 : allocatedSize * 2;
-                        char **tmp = realloc(nonExistCoords, sizeof(char*) * allocatedSize);
-                        if (!tmp) break;
-                        nonExistCoords = tmp;
-                    }
-
-                    char buf[32];                                                     // 좌표 문자열 생성
-                    snprintf(buf, sizeof(buf), "(%s, %d)", col_index_to_letter(j), i + 1); // 열 문자, 행 번호
-                    nonExistCoords[nonExistCount] = strdup(buf);                      // 좌표 저장
-                    nonExistCount++;
+                    actualLastRow = i + 1;
+                    if (firstCol == -1) firstCol = j;
+                    if (j > lastCol) lastCol = j;
+                    continue;
                 }
+                if (nonExistCount >= allocatedSize) {
+                    allocatedSize = allocatedSize ? allocatedSize * 2 : 100;
+                    char **tmp = realloc(nonExistCoords, sizeof(char *) * allocatedSize);
+                    if (!tmp) break; // 메모리 실패
+                    nonExistCoords = tmp;
+                }
+                char buf[32];
+                snprintf(buf, sizeof(buf), "(%s, %d)", col_index_to_letter(j), i + 1);
+                nonExistCoords[nonExistCount++] = duplicate_string(buf);
             }
         }
-
-        fprintf(out, "   시작: %s, %d    종료: %s, %d\n",                             // 데이터 시작/종료 위치 출력
-                col_index_to_letter(firstCol), actualFirstRow,
-                col_index_to_letter(lastCol), actualLastRow);
-        fprintf(out, "   실존 데이터 갯수: %d\n", existCount);                        // 실제 데이터 개수 출력
-        fprintf(out, "   가로(열) × 세로(행) : %d × %d\n", maxCol + 1, maxRow);       // 테이블 크기 출력
-        fprintf(out, "   비실존 데이터 갯수: %d\n", nonExistCount);                   // 비어있는 셀 개수 출력
-        fprintf(out, "   비실존 데이터 좌표값: ");                                    // 비어있는 셀 좌표 출력
+        if (firstRow != -1)
+            output_printf(out, "   시작: %s, %d    종료: %s, %d\n", col_index_to_letter(firstCol), actualFirstRow,
+                          col_index_to_letter(lastCol), actualLastRow); // 시작/종료 위치
+        else
+            output_printf(out, "   시작: -, -    종료: -, -\n"); // 데이터 없음
+        output_printf(out, "   실존 데이터 갯수: %d\n", existCount);
+        output_printf(out, "   가로(열) × 세로(행) : %d × %d\n", maxCol + 1, maxRow);
+        output_printf(out, "   비실존 데이터 갯수: %d\n", nonExistCount);
+        output_printf(out, "   비실존 데이터 좌표값: ");
         for (int k = 0; k < nonExistCount; k++) {
-            fprintf(out, "%s ", nonExistCoords[k]);
-            free(nonExistCoords[k]);                                                  // 좌표 메모리 해제
+            output_printf(out, "%s ", nonExistCoords[k]);
+            free(nonExistCoords[k]);
         }
-        if (nonExistCoords) free(nonExistCoords);                                     // 좌표 배열 해제
-        fprintf(out, "\n\n");
-
-        for (int i = 0; i < cellCount; i++)                                           // 셀 데이터 메모리 해제
-            free(cellData[i]);
+        free(nonExistCoords);
+        output_printf(out, "\n\n");
+        for (size_t i = 0; i < cellCount; i++) free(cellData[i]); // 셀 데이터 해제
+        free(cellData);
         free(cellRows);
         free(cellCols);
-        xlsxioread_sheet_close(sheet);                                                // 시트 닫기
+        xlsxioread_sheet_close(sheet);
     }
+    xlsxioread_sheetlist_close(sheetlist);
+}
 
-    xlsxioread_sheetlist_close(sheetlist);                                            // 시트 목록 닫기
+void set_table_metadata(Table *t, const char *filename)
+{
+    if (!t || !filename) return; // NULL 체크
+    strncpy(t->filepath, filename, sizeof(t->filepath) - 1);
+    t->filepath[sizeof(t->filepath) - 1] = '\0';
+
+    time_t now = time(NULL);
+    struct tm tm;
+    if (localtime_r(&now, &tm)) // 시간 변환 성공
+        strftime(t->timestamp, sizeof(t->timestamp), "%Y.%m.%d %H:%M:%S", &tm);
+    else
+        t->timestamp[0] = '\0'; // 실패 시 빈 문자열
+}
+
+bool analyze_file(const char *filename, OutputSink *out)
+{
+    if (!filename || !out) return false; // NULL 체크
+    const char *ext = file_extension(filename);
+    if (is_excel_file(ext)) {
+        xlsxioreader reader = xlsxioread_open(filename);
+        if (!reader) return false; // 엑셀 파일 열기 실패
+        analyze_all_sheets(reader, filename, out);
+        xlsxioread_close(reader);
+        return true;
+    }
+    Table *t = load_table(filename);
+    if (!t) return false; // 테이블 로드 실패
+    set_table_metadata(t, filename);
+    analyze_table(t, filename, out);
+    destroy_table(t);
+    return true;
 }
