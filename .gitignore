@@ -5,4 +5,6 @@
 !TableManager.h
 !TableManager.c
 !main.c
-!buildTM.sh
+!build.sh
+!Makefile
+!linux_specs.sh
